@@ -27,6 +27,16 @@ import { ApiResponseEvent } from '../telemetry/types.js';
 import { Config } from '../config/config.js';
 import { openaiLogger } from '../utils/openaiLogger.js';
 
+// Extended types to support cache_control
+interface ChatCompletionContentPartTextWithCache extends OpenAI.Chat.ChatCompletionContentPartText {
+  cache_control?: { type: 'ephemeral' };
+}
+
+type ChatCompletionContentPartWithCache = 
+  | ChatCompletionContentPartTextWithCache
+  | OpenAI.Chat.ChatCompletionContentPartImage
+  | OpenAI.Chat.ChatCompletionContentPartRefusal;
+
 // OpenAI API type definitions for logging
 interface OpenAIToolCall {
   id: string;
@@ -37,9 +47,15 @@ interface OpenAIToolCall {
   };
 }
 
+interface OpenAIContentItem {
+  type: 'text';
+  text: string;
+  cache_control?: { type: 'ephemeral' };
+}
+
 interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string | null;
+  content: string | null | OpenAIContentItem[];
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
 }
@@ -905,7 +921,74 @@ export class OpenAIContentGenerator implements ContentGenerator {
 
     // Clean up orphaned tool calls and merge consecutive assistant messages
     const cleanedMessages = this.cleanOrphanedToolCalls(messages);
-    return this.mergeConsecutiveAssistantMessages(cleanedMessages);
+    const mergedMessages = this.mergeConsecutiveAssistantMessages(cleanedMessages);
+    
+    // Add cache control to the last message
+    return this.addCacheControlToLastMessage(mergedMessages);
+  }
+
+  /**
+   * Add cache control to the last message
+   */
+  private addCacheControlToLastMessage(
+    messages: OpenAI.Chat.ChatCompletionMessageParam[],
+  ): OpenAI.Chat.ChatCompletionMessageParam[] {
+    if (messages.length === 0) {
+      return messages;
+    }
+
+    // Get the last message
+    const lastMessageIndex = messages.length - 1;
+
+    // Create a copy of the messages array
+    const updatedMessages = [...messages];
+    const lastMessage = updatedMessages[lastMessageIndex];
+
+    // Only process messages that have content
+    if ('content' in lastMessage && lastMessage.content !== null) {
+      if (typeof lastMessage.content === 'string') {
+        // Convert string content to array format
+        const messageWithArrayContent = {
+          ...lastMessage,
+          content: [
+            {
+              type: 'text',
+              text: lastMessage.content,
+              cache_control: { type: 'ephemeral' },
+            } as ChatCompletionContentPartTextWithCache,
+          ],
+        };
+        updatedMessages[lastMessageIndex] = messageWithArrayContent as OpenAI.Chat.ChatCompletionMessageParam;
+      } else if (Array.isArray(lastMessage.content)) {
+        // If content is already an array, add cache_control to the last item
+        const contentArray = [...lastMessage.content] as ChatCompletionContentPartWithCache[];
+        if (contentArray.length > 0) {
+          const lastItem = contentArray[contentArray.length - 1];
+          if (lastItem.type === 'text') {
+            // Add cache_control to the last text item
+            contentArray[contentArray.length - 1] = {
+              ...lastItem,
+              cache_control: { type: 'ephemeral' },
+            } as ChatCompletionContentPartTextWithCache;
+          } else {
+            // If the last item is not text, add a new text item with cache_control
+            contentArray.push({
+              type: 'text',
+              text: '',
+              cache_control: { type: 'ephemeral' },
+            } as ChatCompletionContentPartTextWithCache);
+          }
+          
+          const messageWithCache = {
+            ...lastMessage,
+            content: contentArray,
+          };
+          updatedMessages[lastMessageIndex] = messageWithCache as OpenAI.Chat.ChatCompletionMessageParam;
+        }
+      }
+    }
+
+    return updatedMessages;
   }
 
   /**
@@ -1537,10 +1620,13 @@ export class OpenAIContentGenerator implements ContentGenerator {
     const cleanedMessages = this.cleanOrphanedToolCallsForLogging(messages);
     const mergedMessages =
       this.mergeConsecutiveAssistantMessagesForLogging(cleanedMessages);
+    
+    // Add cache control to the last message
+    const messagesWithCacheControl = this.addCacheControlToLastMessageForLogging(mergedMessages);
 
     const openaiRequest: OpenAIRequestFormat = {
       model: this.model,
-      messages: mergedMessages,
+      messages: messagesWithCacheControl,
     };
 
     // Add sampling parameters using the same logic as actual API calls
@@ -1555,6 +1641,67 @@ export class OpenAIContentGenerator implements ContentGenerator {
     }
 
     return openaiRequest;
+  }
+
+  /**
+   * Add cache control to the last message for logging purposes
+   */
+  private addCacheControlToLastMessageForLogging(
+    messages: OpenAIMessage[],
+  ): OpenAIMessage[] {
+    if (messages.length === 0) {
+      return messages;
+    }
+
+    // Get the last message
+    const lastMessageIndex = messages.length - 1;
+
+    // Create a copy of the messages array
+    const updatedMessages = [...messages];
+    const lastMessage = updatedMessages[lastMessageIndex];
+
+    // Only process messages that have content
+    if ('content' in lastMessage && lastMessage.content !== null) {
+      if (typeof lastMessage.content === 'string') {
+        // Convert string content to array format
+        updatedMessages[lastMessageIndex] = {
+          ...lastMessage,
+          content: [
+            {
+              type: 'text',
+              text: lastMessage.content,
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+        };
+      } else if (Array.isArray(lastMessage.content)) {
+        // If content is already an array, add cache_control to the last item
+        const contentArray = [...lastMessage.content];
+        if (contentArray.length > 0) {
+          const lastItem = contentArray[contentArray.length - 1];
+          if (lastItem.type === 'text') {
+            // Add cache_control to the last text item
+            contentArray[contentArray.length - 1] = {
+              ...lastItem,
+              cache_control: { type: 'ephemeral' },
+            };
+          } else {
+            // If the last item is not text, add a new text item with cache_control
+            contentArray.push({
+              type: 'text',
+              text: '',
+              cache_control: { type: 'ephemeral' },
+            });
+          }
+          updatedMessages[lastMessageIndex] = {
+            ...lastMessage,
+            content: contentArray,
+          };
+        }
+      }
+    }
+
+    return updatedMessages;
   }
 
   /**
